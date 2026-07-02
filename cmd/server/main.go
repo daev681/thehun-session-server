@@ -11,14 +11,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/thehun/session-server/internal/account"
 	"github.com/thehun/session-server/internal/api"
+	"github.com/thehun/session-server/internal/db"
 	"github.com/thehun/session-server/internal/matchmaking"
 	"github.com/thehun/session-server/internal/session"
 )
 
-// Config는 환경 변수로 오버라이드 가능한 서버 설정입니다.
 type Config struct {
 	HTTPPort        int
+	DatabaseURL     string
 	GameServerHost  string
 	GameServerPort  int
 	PlayersPerMatch int
@@ -37,6 +39,7 @@ func loadConfig() Config {
 			cfg.HTTPPort = n
 		}
 	}
+	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
 	if v := os.Getenv("GAME_SERVER_HOST"); v != "" {
 		cfg.GameServerHost = v
 	}
@@ -57,14 +60,31 @@ func loadConfig() Config {
 func main() {
 	cfg := loadConfig()
 
+	ctx := context.Background()
+
+	if cfg.DatabaseURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
+
+	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("db connect: %v", err)
+	}
+	defer pool.Close()
+
+	if err := db.Migrate(ctx, pool); err != nil {
+		log.Fatalf("db migrate: %v", err)
+	}
+	log.Println("database connected and migrated")
+
+	accountRepo  := account.NewRepo(pool)
 	sessionStore := session.NewStore()
-	matchQueue := matchmaking.NewQueue(
+	matchQueue   := matchmaking.NewQueue(
 		cfg.PlayersPerMatch,
 		cfg.GameServerHost,
 		cfg.GameServerPort,
 	)
 
-	// 만료된 매칭 티켓 주기적으로 정리
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -73,8 +93,8 @@ func main() {
 		}
 	}()
 
-	handler := api.NewHandler(sessionStore, matchQueue)
-	router := api.NewRouter(handler)
+	handler := api.NewHandler(sessionStore, matchQueue, accountRepo)
+	router  := api.NewRouter(handler)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
@@ -84,7 +104,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -101,9 +120,9 @@ func main() {
 	<-quit
 	log.Println("shutting down...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("server shutdown error: %v", err)
 	}
 

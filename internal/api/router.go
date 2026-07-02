@@ -9,14 +9,18 @@ import (
 func NewRouter(h *Handler) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/auth/login",    methodOnly(http.MethodPost, h.Login))
-	mux.HandleFunc("/auth/logout",   methodOnly(http.MethodPost, h.Logout))
-	mux.HandleFunc("/auth/me",       methodOnly(http.MethodGet,  h.Me))
-	mux.HandleFunc("/auth/validate", methodOnly(http.MethodGet,  h.ValidateToken))
+	mux.HandleFunc("/auth/register",  methodOnly(http.MethodPost, h.Register))
+	mux.HandleFunc("/auth/login",     methodOnly(http.MethodPost, h.Login))
+	mux.HandleFunc("/auth/logout",    methodOnly(http.MethodPost, h.Logout))
+	mux.HandleFunc("/auth/me",        methodOnly(http.MethodGet,  h.Me))
+	mux.HandleFunc("/auth/validate",  methodOnly(http.MethodGet,  h.ValidateToken))
 
-	mux.HandleFunc("/match/enter",   methodOnly(http.MethodPost, h.MatchEnter))
-	mux.HandleFunc("/match/cancel",  methodOnly(http.MethodPost, h.MatchCancel))
-	mux.HandleFunc("/match/status",  methodOnly(http.MethodGet,  h.MatchStatus))
+	mux.HandleFunc("/player/stats",   methodOnly(http.MethodGet,  h.PlayerStats))
+	mux.HandleFunc("/player/result",  methodOnly(http.MethodPost, h.PlayerResult))
+
+	mux.HandleFunc("/match/enter",    methodOnly(http.MethodPost, h.MatchEnter))
+	mux.HandleFunc("/match/cancel",   methodOnly(http.MethodPost, h.MatchCancel))
+	mux.HandleFunc("/match/status",   methodOnly(http.MethodGet,  h.MatchStatus))
 
 	mux.HandleFunc("/health", h.Health)
 
