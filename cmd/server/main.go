@@ -15,12 +15,14 @@ import (
 	"github.com/thehun/session-server/internal/api"
 	"github.com/thehun/session-server/internal/db"
 	"github.com/thehun/session-server/internal/matchmaking"
+	"github.com/thehun/session-server/internal/registry"
 	"github.com/thehun/session-server/internal/session"
 )
 
 type Config struct {
 	HTTPPort        int
 	DatabaseURL     string
+	SessionTTL      time.Duration
 	GameServerHost  string
 	GameServerPort  int
 	PlayersPerMatch int
@@ -29,6 +31,7 @@ type Config struct {
 func loadConfig() Config {
 	cfg := Config{
 		HTTPPort:        8080,
+		SessionTTL:      24 * time.Hour,
 		GameServerHost:  "127.0.0.1",
 		GameServerPort:  7777,
 		PlayersPerMatch: 2,
@@ -40,6 +43,11 @@ func loadConfig() Config {
 		}
 	}
 	cfg.DatabaseURL = os.Getenv("DATABASE_URL")
+	if v := os.Getenv("SESSION_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.SessionTTL = time.Duration(n) * time.Second
+		}
+	}
 	if v := os.Getenv("GAME_SERVER_HOST"); v != "" {
 		cfg.GameServerHost = v
 	}
@@ -75,25 +83,29 @@ func main() {
 	if err := db.Migrate(ctx, pool); err != nil {
 		log.Fatalf("db migrate: %v", err)
 	}
-	log.Println("database connected and migrated")
+	log.Printf("database connected (TTL=%s)", cfg.SessionTTL)
 
-	accountRepo  := account.NewRepo(pool)
-	sessionStore := session.NewStore()
-	matchQueue   := matchmaking.NewQueue(
-		cfg.PlayersPerMatch,
-		cfg.GameServerHost,
-		cfg.GameServerPort,
-	)
+	accountRepo   := account.NewRepo(pool)
+	sessionStore  := session.NewStore(cfg.SessionTTL)
+	gameRegistry  := registry.NewStore()
+	matchQueue    := matchmaking.NewQueue(cfg.PlayersPerMatch, gameRegistry)
 
+	// 주기적인 정리 작업
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			expiredSessions := sessionStore.Cleanup()
 			matchQueue.CleanupExpired()
+			prunedServers := gameRegistry.PruneUnhealthy()
+			if expiredSessions > 0 || prunedServers > 0 {
+				log.Printf("cleanup: %d expired sessions, %d pruned servers",
+					expiredSessions, prunedServers)
+			}
 		}
 	}()
 
-	handler := api.NewHandler(sessionStore, matchQueue, accountRepo)
+	handler := api.NewHandler(sessionStore, matchQueue, accountRepo, gameRegistry)
 	router  := api.NewRouter(handler)
 
 	srv := &http.Server{
@@ -108,9 +120,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("session-server listening on :%d", cfg.HTTPPort)
-		log.Printf("game server: %s:%d  players/match: %d",
-			cfg.GameServerHost, cfg.GameServerPort, cfg.PlayersPerMatch)
+		log.Printf("session-server listening on :%d  session_ttl=%s  players/match=%d",
+			cfg.HTTPPort, cfg.SessionTTL, cfg.PlayersPerMatch)
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe error: %v", err)
