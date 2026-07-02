@@ -4,20 +4,36 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/thehun/session-server/internal/account"
 	"github.com/thehun/session-server/internal/matchmaking"
+	"github.com/thehun/session-server/internal/ratelimit"
+	"github.com/thehun/session-server/internal/registry"
 	"github.com/thehun/session-server/internal/session"
 )
 
 type Handler struct {
-	sessions *session.Store
-	queue    *matchmaking.Queue
-	accounts *account.Repo
+	sessions    *session.Store
+	queue       *matchmaking.Queue
+	accounts    *account.Repo
+	registry    *registry.Store
+	loginLimiter *ratelimit.Limiter
 }
 
-func NewHandler(sessions *session.Store, queue *matchmaking.Queue, accounts *account.Repo) *Handler {
-	return &Handler{sessions: sessions, queue: queue, accounts: accounts}
+func NewHandler(
+	sessions *session.Store,
+	queue *matchmaking.Queue,
+	accounts *account.Repo,
+	reg *registry.Store,
+) *Handler {
+	return &Handler{
+		sessions:     sessions,
+		queue:        queue,
+		accounts:     accounts,
+		registry:     reg,
+		loginLimiter: ratelimit.New(10, 60_000_000_000), // 10 req/min per IP
+	}
 }
 
 // --- 공통 헬퍼 ---
@@ -41,10 +57,24 @@ func (h *Handler) requireSession(r *http.Request) (*session.Info, string, bool) 
 	return info, token, ok
 }
 
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		return strings.SplitN(fwd, ",", 2)[0]
+	}
+	if real := r.Header.Get("X-Real-IP"); real != "" {
+		return real
+	}
+	// Strip port from RemoteAddr
+	addr := r.RemoteAddr
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		return addr[:i]
+	}
+	return addr
+}
+
 // --- Auth 핸들러 ---
 
 // POST /auth/register
-// Body: {"account_id":"alice","password":"pw123","display_name":"Alice"}
 func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AccountID   string `json:"account_id"`
@@ -85,9 +115,13 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /auth/login
-// Body: {"account_id":"alice","password":"pw123"}
-// Response: {"session_token":"...","account_id":"alice"}
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if !h.loginLimiter.Allow(ip) {
+		writeError(w, http.StatusTooManyRequests, "too many login attempts, try again later")
+		return
+	}
+
 	var req struct {
 		AccountID string `json:"account_id"`
 		Password  string `json:"password"`
@@ -123,8 +157,25 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /auth/refresh
+// 토큰 만료 전 갱신. 기존 토큰 무효화 후 새 토큰 발급 (TTL 리셋).
+func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
+	_, oldToken, ok := h.requireSession(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "invalid or expired session token")
+		return
+	}
+
+	newToken, err := h.sessions.Refresh(oldToken)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "refresh failed: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"session_token": newToken})
+}
+
 // POST /auth/logout
-// Header: X-Session-Token: <token>
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	_, token, ok := h.requireSession(r)
 	if !ok {
@@ -136,18 +187,19 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /auth/me
-// Header: X-Session-Token: <token>
 func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	info, _, ok := h.requireSession(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid or missing session token")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"account_id": info.AccountID})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account_id": info.AccountID,
+		"expires_at": info.ExpiresAt,
+	})
 }
 
 // GET /auth/validate?token=<token>
-// C++ 리얼타임서버가 클라이언트 토큰을 검증할 때 호출합니다.
 func (h *Handler) ValidateToken(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	info, ok := h.sessions.Get(token)
@@ -164,7 +216,6 @@ func (h *Handler) ValidateToken(w http.ResponseWriter, r *http.Request) {
 // --- Player 핸들러 ---
 
 // GET /player/stats
-// Header: X-Session-Token: <token>
 func (h *Handler) PlayerStats(w http.ResponseWriter, r *http.Request) {
 	info, _, ok := h.requireSession(r)
 	if !ok {
@@ -192,8 +243,6 @@ func (h *Handler) PlayerStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /player/result
-// 리얼타임서버가 게임 종료 후 호출 (승/패 기록)
-// Body: {"winner":"accountId","losers":["accountId1",...]}
 func (h *Handler) PlayerResult(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Winner string   `json:"winner"`
@@ -216,11 +265,76 @@ func (h *Handler) PlayerResult(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{})
 }
 
+// --- Game Server Registry 핸들러 ---
+
+// POST /game-server/register
+// 리얼타임서버가 시작 시 자신을 등록합니다.
+// Body: {"host":"1.2.3.4","port":7777,"max_players":100}
+func (h *Handler) RegisterGameServer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Host       string `json:"host"`
+		Port       int    `json:"port"`
+		MaxPlayers int    `json:"max_players"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.Host == "" || req.Port == 0 {
+		writeError(w, http.StatusBadRequest, "host and port are required")
+		return
+	}
+	if req.MaxPlayers <= 0 {
+		req.MaxPlayers = 100
+	}
+
+	gs, err := h.registry.Register(req.Host, req.Port, req.MaxPlayers)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "register failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, gs)
+}
+
+// POST /game-server/heartbeat
+// 리얼타임서버가 주기적으로 현재 접속자 수를 보고합니다.
+// Body: {"id":"abc123","current_players":42}
+func (h *Handler) GameServerHeartbeat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID             string `json:"id"`
+		CurrentPlayers int    `json:"current_players"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	if err := h.registry.Heartbeat(req.ID, req.CurrentPlayers); err != nil {
+		writeError(w, http.StatusNotFound, "game server not found — re-register")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{})
+}
+
+// POST /game-server/unregister
+// 리얼타임서버 셧다운 시 호출합니다.
+func (h *Handler) UnregisterGameServer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(r.Body).Decode(&req) //nolint:errcheck
+	h.registry.Unregister(req.ID)
+	writeJSON(w, http.StatusOK, map[string]string{})
+}
+
+// GET /game-server/list  (내부 관리용)
+func (h *Handler) ListGameServers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.registry.List())
+}
+
 // --- Matchmaking 핸들러 ---
 
 // POST /match/enter
-// Header: X-Session-Token: <token>
-// Body: {"game_mode":"ranked"} (선택)
 func (h *Handler) MatchEnter(w http.ResponseWriter, r *http.Request) {
 	info, _, ok := h.requireSession(r)
 	if !ok {
@@ -238,29 +352,24 @@ func (h *Handler) MatchEnter(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]string{"ticket_id": ticketID})
 }
 
 // POST /match/cancel
-// Header: X-Session-Token: <token>
 func (h *Handler) MatchCancel(w http.ResponseWriter, r *http.Request) {
 	info, _, ok := h.requireSession(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "invalid or missing session token")
 		return
 	}
-
 	if err := h.queue.Cancel(info.AccountID); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]string{})
 }
 
 // GET /match/status
-// Header: X-Session-Token: <token>
 func (h *Handler) MatchStatus(w http.ResponseWriter, r *http.Request) {
 	info, _, ok := h.requireSession(r)
 	if !ok {
@@ -290,9 +399,18 @@ func (h *Handler) MatchStatus(w http.ResponseWriter, r *http.Request) {
 
 // GET /health
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	servers := h.registry.List()
+	healthy := 0
+	for _, s := range servers {
+		if s.IsHealthy() {
+			healthy++
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":          "ok",
 		"active_sessions": h.sessions.Count(),
 		"queue_length":    h.queue.QueueLength(),
+		"game_servers":    len(servers),
+		"healthy_servers": healthy,
 	})
 }
